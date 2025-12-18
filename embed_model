@@ -1,0 +1,43 @@
+import os
+from sentence_transformers import SentenceTransformer
+
+CACHE_DIR = r"D:\huggingface_cache"
+
+MODEL_BASE_DIR = os.path.join(
+    CACHE_DIR,
+    "models--nomic-ai--nomic-embed-text-v1.5",
+    "snapshots"
+)
+
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["HUGGINGFACE_HUB_CACHE"] = CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+_embed_model = None
+
+
+def _resolve_model_path():
+    if not os.path.exists(MODEL_BASE_DIR):
+        raise RuntimeError("HF snapshot directory not found")
+
+    snaps = os.listdir(MODEL_BASE_DIR)
+    if not snaps:
+        raise RuntimeError("No HF snapshots found")
+
+    return os.path.join(MODEL_BASE_DIR, snaps[0])
+
+
+def get_embed_model():
+    global _embed_model
+
+    if _embed_model is None:
+        model_path = _resolve_model_path()
+        print(">>> Loading embedding model (OFFLINE)")
+        _embed_model = SentenceTransformer(
+            model_path,
+            trust_remote_code=True
+        )
+
+    return _embed_model
