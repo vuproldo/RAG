@@ -1,0 +1,86 @@
+import sys
+import importlib
+import platform
+import subprocess
+
+REQUIRED_PYTHON = (3, 9)
+
+REQUIRED_PACKAGES = {
+    "numpy": "numpy",
+    "sentence_transformers": "sentence-transformers",
+    "faiss": "faiss-cpu",
+    "llama_cpp": "llama-cpp-python"
+}
+
+
+def run(cmd):
+    subprocess.run(cmd, shell=True, check=False)
+
+
+def check_python():
+    print("🔎 Проверка версии Python...")
+    if sys.version_info < REQUIRED_PYTHON:
+        print(f"❌ Требуется Python {REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]}+")
+        print(f"   Найден: {sys.version.split()[0]}")
+        sys.exit(1)
+    print(f"✅ Python {sys.version.split()[0]}")
+
+
+def check_and_install_packages():
+    print("\n🔎 Проверка зависимостей...")
+    missing = []
+
+    for module, pip_name in REQUIRED_PACKAGES.items():
+        try:
+            importlib.import_module(module)
+            print(f"✅ {module}")
+        except ImportError:
+            print(f"❌ {module}")
+            missing.append(pip_name)
+
+    if missing:
+        print("\n📦 Устанавливаю недостающие пакеты:")
+        cmd = f"{sys.executable} -m pip install " + " ".join(missing)
+        print(cmd)
+        run(cmd)
+
+
+def check_faiss():
+    print("\n🔎 Проверка FAISS...")
+    try:
+        import faiss
+        faiss.IndexFlatIP(4)
+        print("✅ FAISS работает")
+    except Exception as e:
+        print("❌ FAISS проблема:", e)
+        sys.exit(1)
+
+
+def check_llama():
+    print("\n🔎 Проверка llama-cpp...")
+    try:
+        from llama_cpp import Llama
+        print("✅ llama-cpp-python работает")
+    except Exception as e:
+        print("❌ llama-cpp-python ошибка:", e)
+        sys.exit(1)
+
+
+def check_platform():
+    print("\n💻 Платформа:")
+    print(f"OS: {platform.system()} {platform.release()}")
+    print(f"CPU: {platform.processor()}")
+
+
+def main():
+    print("=== RAG Environment Auto-Check ===\n")
+    check_python()
+    check_and_install_packages()
+    check_faiss()
+    check_llama()
+    check_platform()
+    print("\n✅ Окружение готово.\n")
+
+
+if __name__ == "__main__":
+    main()
