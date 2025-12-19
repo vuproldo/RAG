@@ -1,199 +1,209 @@
-# rag_module.py
+"""
+Основной RAG модуль для ответов на вопросы на основе контекста тренировок
+Использует локально загруженную Llama модель
+"""
 import os
 import sqlite3
-import pickle
-import numpy as np
-import faiss
-
-# LLM optional
-try:
-    from llama_cpp import Llama
-    LLM_AVAILABLE = True
-except Exception:
-    LLM_AVAILABLE = False
-
-from sentence_transformers import SentenceTransformer
+from typing import List
+from embedding import get_embeddings_for_search
+from build_faiss import get_similar_contexts
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "Database", "TrainingDiaryVector.db")
-RAG_DIR = os.path.join(BASE_DIR, "rag")
-FAISS_PATH = os.path.join(RAG_DIR, "vector_index.bin")
-META_PATH = os.path.join(RAG_DIR, "vector_index.bin.meta")
-MODEL_GGUF = os.path.join(BASE_DIR, "models", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf")  
+MODEL_PATH = r"D:\Proekt_Trainer-ProjectTrainer\Models\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
-os.makedirs(RAG_DIR, exist_ok=True)
-CACHE_DIR = r"D:\huggingface_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ["HF_HOME"] = CACHE_DIR
-os.environ["HUGGINGFACE_HUB_CACHE"] = CACHE_DIR
-os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
+# Кеш для модели
+_llm = None
 
-# embedding model for queries
-query_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
 
-TOP_K = 6
-MAX_TOKENS = 512
-N_THREADS = 6
-HISTORY_KEEP = 6  # keep last N turns (user+assistant pairs) when building prompt
-
-# ---------- DB helpers ----------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""CREATE TABLE IF NOT EXISTS rag_cache(
-                        query TEXT PRIMARY KEY,
-                        answer TEXT
-                    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS rag_history(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        role TEXT,       -- 'user' or 'assistant'
-                        text TEXT,
-                        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )""")
-    conn.commit()
-    return conn
-
-# ---------- FAISS ----------
-def load_faiss():
-    if not os.path.exists(FAISS_PATH) or not os.path.exists(META_PATH):
-        raise FileNotFoundError("FAISS index or meta not found. Run build_faiss.py")
-    index = faiss.read_index(FAISS_PATH)
-    with open(META_PATH, "rb") as f:
-        meta = pickle.load(f)
-    return index, meta
-
-def semantic_search(query_text, top_k=TOP_K):
-    index, meta = load_faiss()
-    q_emb = np.array(query_model.encode([query_text]), dtype="float32")
-    faiss.normalize_L2(q_emb)
-    D, I = index.search(q_emb, top_k)
-    results = []
-    seen_texts = set()
-    for idx in I[0]:
-        if idx < len(meta):
-            text = meta[idx].get("text","")
-            if text and text not in seen_texts:
-                seen_texts.add(text)
-                results.append(meta[idx])
-    return results
-
-# ---------- History handling ----------
-def append_history(role: str, text: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO rag_history(role, text) VALUES (?, ?)", (role, text))
-    conn.commit()
-    conn.close()
-
-def get_recent_history(max_pairs=HISTORY_KEEP):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT role, text FROM rag_history ORDER BY id DESC LIMIT ?", (max_pairs*2,))
-    rows = cur.fetchall()[::-1]  # reverse back to chronological order
-    conn.close()
-    cleaned = []
-    prev = None
-    for role, text in rows:
-        if text.strip() == "":
-            continue
-        if prev is None or text.strip() != prev:
-            cleaned.append((role, text.strip()))
-            prev = text.strip()
-    return cleaned[-(max_pairs*2):]
-
-def build_history_block():
-    hist = get_recent_history(HISTORY_KEEP)
-    if not hist:
-        return ""
-    out_lines = []
-    for role, text in hist:
-        tag = "Пользователь" if role == "user" else "Ассистент"
-        out_lines.append(f"{tag}: {text}")
-    return "\n".join(out_lines)
-
-# ---------- Prompt building ----------
-def build_prompt(user_query: str, retrieved: list):
-    history_block = build_history_block()
-    seen = set()
-    ctx_lines = []
-    for item in retrieved:
-        t = item.get("text","").strip()
-        if not t or t in seen:
-            continue
-        if len(t) > 800:
-            t = t[:800] + "..."
-        ctx_lines.append(t)
-    context = "\n\n".join(ctx_lines)
-
-    prompt_sections = []
-    prompt_sections.append("<|begin_of_text|>")
-    if history_block:
-        prompt_sections.append("История диалога (последние ходы):\n" + history_block)
-    if context:
-        prompt_sections.append("Релевантный контекст из базы:\n" + context)
-    prompt_sections.append(f"Вопрос пользователя: {user_query}")
-    prompt_sections.append("<|end_of_text|>")
-    return "\n\n".join(prompt_sections)
-
-# ---------- LLM call ----------
-def call_llm(prompt: str) -> str:
-    if LLM_AVAILABLE and os.path.exists(MODEL_GGUF):
+def get_llm():
+    """Загружает LLM модель (ленивая загрузка)"""
+    global _llm
+    if _llm is None:
         try:
-            llm = Llama(model_path=MODEL_GGUF, n_threads=N_THREADS, n_ctx=2048)
-            resp = llm(prompt, max_tokens=MAX_TOKENS)
-            text = resp.get("choices", [{}])[0].get("text", "").strip()
-            if text:
-                return text
+            from llama_cpp import Llama
+            
+            if not os.path.exists(MODEL_PATH):
+                raise FileNotFoundError(f"Модель не найдена: {MODEL_PATH}")
+            
+            print(f"Загружаю модель Llama:  {MODEL_PATH}")
+            _llm = Llama(
+                model_path=MODEL_PATH,
+                n_gpu_layers=-1,
+                n_ctx=8192,
+                verbose=False
+            )
+            print("✓ Модель Llama загружена")
         except Exception as e:
-            return f"(LLM error) модель выдала ошибку: {e}\n\nСформированный ответ на основе контекста:\n\n{prompt}"
-    out = "LLM недоступен — возвращаю сводку по контексту и инструкцию:\n\n"
-    out += "Контекст:\n" + (prompt[:4000] + ("..." if len(prompt)>4000 else ""))
-    out += "\n\nИнструкция: Сформируй программу тренировок на основе приведённого контекста и запроса."
-    return out
+            print(f"✗ Ошибка при загрузке модели: {e}")
+            raise
+    
+    return _llm
 
-# ---------- caching ----------
-def get_cached(query: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT answer FROM rag_cache WHERE query = ?", (query,))
-    r = cur.fetchone()
-    conn.close()
-    return r[0] if r else None
 
-def cache_answer(query: str, answer: str):
-    conn = get_conn()
-    cur = conn.cursor()
+def get_system_prompt():
+    """Возвращает расширенный системный промпт для ассистента"""
+    return """Ты опытный персональный тренер по фитнесу с 15+ летним стажем. 
+
+ТВОИ ПРИНЦИПЫ:
+1. Персонализация - ВСЕГДА используй данные из истории тренировок пользователя
+2. Прогрессия - рекомендации должны основываться на текущем уровне
+3. Безопасность - подчеркивай правильную технику и предотвращение травм
+4. Практичность - рекомендации должны быть реально выполнимыми
+
+ВАЖНЫЕ ПРАВИЛА РУССКОГО ЯЗЫКА:
+- НЕ ИСПОЛЬЗУЙ слово "набор", используй ТОЛЬКО "подход" для упражнений
+- НЕ ИСПОЛЬЗУЙ слово "упражнение" после описания упражнения - используй название упражнения как существительное
+- Правильно:  "Жим штанги лежа развивает грудные мышцы"
+- Неправильно: "Жим штанги лежа - это упражнение развивает грудные мышцы"
+- ВСЕГДА согласуй род:  "это упражнение" (ср. р.), "эта мышца" (ж.р.), "этот вес" (м.р.)
+- НИКОГДА не повторяй одно и то же упражнение для разных мышечных групп
+- ИЗБЕГАЙ фраз вроде "помогает разрабатывать", используй "развивает", "укрепляет", "прорабатывает"
+
+ПРИ ПЛАНИРОВАНИИ ТРЕНИРОВОК:  
+- Анализируй предыдущие веса и объемы пользователя
+- Предлагай прогрессию:  +5-10% от текущего веса или +1-2 повторения
+- Учитывай мышечные группы, которые уже тренировались
+- Предлагай вариации упражнений для прогресса (дропсеты, суперсеты, паузы)
+- Указывай конкретные веса на основе истории, а не в общем виде
+
+СТРУКТУРА ОТВЕТА ДЛЯ ТРЕНИРОВОЧНОГО ПЛАНА:
+1. АНАЛИЗ ТЕКУЩЕГО СОСТОЯНИЯ
+   - Текущий уровень силы (на основе весов из истории)
+   - Слабые и сильные стороны
+   - Рекомендуемая интенсивность
+
+2. ПЛАН ТРЕНИРОВКИ (разделить по дням если нужно)
+   Для каждого упражнения указать:
+   - Название и целевая мышца
+   - Вид упражнения (compound/isolation)
+   - Подходы x повторения
+   - Рабочий вес (конкретное число!)
+   - Техника выполнения (3-4 ключевых момента)
+   - Время отдыха между подходами
+
+3. ПРОГРЕССИЯ
+   - Как увеличить сложность через 2-3 недели
+   - Альтернативные упражнения для разнообразия
+
+4. ВАЖНЫЕ ЗАМЕЧАНИЯ
+   - Противопоказания/внимание
+   - Как избежать травм
+   - Когда обратиться к специалисту
+
+ФОРМАТИРОВАНИЕ:
+- Используй **жирный текст** для заголовков
+- Используй • маркеры для списков
+- Используй таблицы для сравнения вариантов
+- Разделяй блоки пустыми строками для читаемости
+
+ПРИМЕРЫ ПРАВИЛЬНО СФОРМУЛИРОВАННЫХ РЕКОМЕНДАЦИЙ: 
+✅ "Жим штанги лежа - 4 подхода по 8-10 повторений, рабочий вес 20 кг.  Техника: руки прижаты к корпусу, движение только в локтевом суставе, пауза 1 сек в верхней точке, отдых 90 сек"
+❌ "Жим штанги лежа - это классическое упражнение помогает разрабатывать..."
+
+✅ "Концентрированные сгибания гантели (isolation) - 3 подхода по 12-15 повторений, вес 8 кг, отдых 60 сек"
+❌ "Концентрированные сгибания гантели - этот вариант помогает разрабатывать..."
+
+ЧАСТЫЕ ОШИБКИ ДЛЯ ИСПРАВЛЕНИЯ: 
+❌ "набор" → ✅ "подход"
+❌ "разрабатывать мышцы" → ✅ "прорабатывать мышцы" или "развивать мышцы"
+❌ "эта упражнение" → ✅ "это упражнение"
+❌ "этот мышца" → ✅ "эта мышца"
+❌ "повторение упражнения" для разных групп → ✅ разные упражнения для каждой группы
+❌ "помогает разрабатывать" (многословно) → ✅ "развивает" или "прорабатывает" (кратко)
+
+ЯЗЫК:  Русский, четкий, профессиональный, без стилистических ошибок
+АУДИТОРИЯ: Люди, серьезно занимающиеся фитнесом"""
+
+
+def format_context(similar_contexts: List[tuple]) -> str:
+    """Форматирует найденный контекст для передачи в LLM"""
+    if not similar_contexts:
+        return "📊 ИСТОРИЯ ТРЕНИРОВОК:  Данные не найдены (новый пользователь)"
+    
+    context_text = "📊 ИСТОРИЯ ТРЕНИРОВОК И ПРОГРЕСС:\n"
+    context_text += "="*60 + "\n\n"
+    
+    for i, (text, distance, user_id) in enumerate(similar_contexts, 1):
+        relevance = max(0, 100 - int(distance * 10))
+        context_text += f"[Информация {i} - релевантность: {relevance}%]\n"
+        context_text += text
+        context_text += "\n" + "-"*60 + "\n"
+    
+    return context_text
+
+
+def answer_question(question: str, user_id: int = None, num_contexts: int = 5) -> str:
+    """
+    Отвечает на вопрос на основе RAG контекста
+    """
     try:
-        cur.execute("INSERT OR REPLACE INTO rag_cache(query, answer) VALUES (?, ?)", (query, answer))
-        conn.commit()
-    except Exception:
-        pass
-    conn.close()
+        # 1. Создаем эмбеддинг вопроса
+        print("[RAG] Создаю эмбеддинг вопроса...")
+        question_embedding = get_embeddings_for_search(question)
+        
+        # 2. Получаем похожий контекст
+        print("[RAG] Ищу релевантный контекст из истории...")
+        similar_contexts = get_similar_contexts(question_embedding, k=num_contexts)
+        
+        # 3. Форматируем контекст
+        formatted_context = format_context(similar_contexts)
+        
+        # 4. Загружаем модель
+        print("[RAG] Загружаю LLM модель...")
+        llm = get_llm()
+        
+        # 5. Создаем промпт
+        system_prompt = get_system_prompt()
+        
+        user_prompt = f"""{formatted_context}
 
-# ---------- main API ----------
-def answer_question(user_query: str, top_k=TOP_K):
-    user_query = user_query.strip()
-    if user_query == "":
-        return "Пустой запрос."
+❓ ВОПРОС:  {question}
 
-    hist = get_recent_history(1)
-    if hist and hist[-1][0] == "user" and hist[-1][1].strip().lower() == user_query.lower():
-        return "Этот запрос уже был получен как последний — повторный ответ пропущен."
+📝 ОТВЕТ:  """
+        
+        # 6. Генерируем ответ
+        print("[RAG] Генерирую ответ (это может занять время)...")
+        response = llm(
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n",
+            max_tokens=2048,
+            temperature=0.6,
+            top_p=0.95,
+            top_k=40,
+            repeat_penalty=1.2,
+            echo=False
+        )
+        
+        answer = response['choices'][0]['text']. strip()
+        
+        # Очистка системных токенов
+        if "<|im_end|>" in answer:
+            answer = answer.split("<|im_end|>")[0].strip()
+        
+        return answer
+    
+    except FileNotFoundError as e:
+        return f"❌ Ошибка: {str(e)}"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Ошибка при обработке вопроса: {str(e)}"
 
-    cached = get_cached(user_query)
-    if cached:
-        append_history("user", user_query)
-        append_history("assistant", cached)
-        return cached
 
-    retrieved = semantic_search(user_query, top_k=top_k)
-    prompt = build_prompt(user_query, retrieved)
-    answer = call_llm(prompt)
-    cache_answer(user_query, answer)
-    append_history("user", user_query)
-    append_history("assistant", answer)
-
-    return answer
-
-# quick test
-if __name__ == "__main__":
-    print(answer_question("Сделай программу на 3 дня в неделю, цель — набор массы"))
+def get_user_stats(user_id: int) -> str:
+    """Получает статистику пользователя"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT context_text FROM TrainingContext
+            WHERE user_id = ?  AND source_table = 'Progress'
+            LIMIT 1
+        """, (user_id,))
+        
+        row = cur.fetchone()
+        return row[0] if row else "Нет данных о прогрессе"
+    
+    finally:
+        conn.close()

@@ -1,69 +1,106 @@
-# embedding.py
+"""
+Модуль для создания эмбеддингов из текстового контекста тренировок
+"""
 import os
 import sqlite3
+import pickle
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from typing import List
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "Database", "TrainingDiaryVector.db")
-TABLE = "VectorMetadata"
+TABLE = "TrainingContext"
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# Кеш для модели
+_model = None
+
+print(f"[INFO] DB_PATH в embedding.py: {DB_PATH}")
 
 
-CACHE_DIR = r"D:\huggingface_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ.setdefault("HF_HOME", CACHE_DIR)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", CACHE_DIR)
-os.environ.setdefault("TRANSFORMERS_CACHE", CACHE_DIR)
+def get_model():
+    """Получает модель эмбеддингов (ленивая загрузка)"""
+    global _model
+    if _model is None:
+        print(f"Загружаю модель:   {EMBEDDING_MODEL}")
+        os.environ['HF_HOME'] = r"D:\huggingface_cache"
+        _model = SentenceTransformer(EMBEDDING_MODEL)
+    return _model
 
-# load embedding model
-print(">>> Loading embedding model (nomic-ai/nomic-embed-text-v1.5)...")
-embed_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
-print(">>> Embedding model loaded.")
 
-def ensure_table_and_column():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # ensure table exists
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (TABLE,))
-    if not cur.fetchone():
-        conn.close()
-        raise FileNotFoundError(f"Table {TABLE} not found in DB {DB_PATH}")
-    # ensure embedding column exists
-    cur.execute(f"PRAGMA table_info({TABLE});")
-    cols = [r[1] for r in cur.fetchall()]
-    if "embedding" not in cols:
-        cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN embedding BLOB;")
-        conn.commit()
-    conn.close()
-
-def create_embeddings(batch_size: int = 64):
-    """
-    Create embeddings for rows in VectorMetadata.text where embedding is NULL.
-    Saves embeddings as raw bytes (float32).
-    """
-    ensure_table_and_column()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(f"SELECT index_id, text FROM {TABLE} WHERE embedding IS NULL OR embedding = ''")
-    rows = cur.fetchall()
-    if not rows:
-        print("No new rows to embed.")
-        conn.close()
-        return
-
-    print(f"Creating embeddings for {len(rows)} rows...")
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i+batch_size]
-        texts = [r[1] if r[1] is not None else "" for r in batch]
-        vecs = embed_model.encode(texts, show_progress_bar=False)
-        vecs = np.array(vecs, dtype=np.float32)
-        for (index_id, _), vec in zip(batch, vecs):
-            cur.execute(f"UPDATE {TABLE} SET embedding = ? WHERE index_id = ?", (vec.tobytes(), index_id))
-        conn.commit()
-        print(f"  processed {min(i+batch_size, len(rows))}/{len(rows)}")
-    conn.close()
-    print("Embeddings created.")
+def create_embeddings():
+    """Создает эмбеддинги для всех текстов контекста, которые еще не имеют эмбеддингов"""
     
+    # Проверяем что БД существует
+    if not os.path.exists(DB_PATH):
+        print(f"✗ БД не найдена: {DB_PATH}")
+        raise FileNotFoundError(f"БД не найдена: {DB_PATH}")
+    
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    try:
+        # Проверяем что таблица существует
+        cur.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{TABLE}'")
+        if not cur.fetchone():
+            print(f"✗ Таблица {TABLE} не найдена в {DB_PATH}")
+            raise ValueError(f"Таблица {TABLE} не найдена")
+        
+        print(f"✓ Таблица {TABLE} найдена")
+        
+        # Получаем записи без эмбеддингов
+        cur.execute(f"""
+            SELECT id, context_text 
+            FROM {TABLE} 
+            WHERE embedding IS NULL
+            LIMIT 1000
+        """)
+        rows = cur.fetchall()
+        
+        print(f"Найдено {len(rows)} записей без эмбеддингов")
+        
+        if not rows:
+            print(f"✓ Все записи в {TABLE} уже имеют эмбеддинги")
+            return
+        
+        print(f"Создаю эмбеддинги для {len(rows)} записей...")
+        model = get_model()
+        
+        for idx, (row_id, text) in enumerate(rows, 1):
+            try:
+                # Создаем эмбеддинг
+                embedding = model.encode(text)
+                embedding_bytes = pickle.dumps(embedding)
+                
+                # Сохраняем в БД
+                cur.execute(f"""
+                    UPDATE {TABLE}
+                    SET embedding = ?   
+                    WHERE id = ?  
+                """, (embedding_bytes, row_id))
+                
+                if idx % 10 == 0:
+                    print(f"  {idx}/{len(rows)} обработано...")
+            
+            except Exception as e:
+                print(f"  ✗ Ошибка при обработке записи {row_id}: {e}")
+        
+        conn.commit()
+        print(f"✓ Эмбеддинги успешно созданы для {len(rows)} записей")
+        
+    except Exception as e:
+        print(f"✗ Ошибка при создании эмбеддингов: {e}")
+        import traceback
+        traceback.print_exc()
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-if __name__ == "__main__":
-    create_embeddings()
+
+def get_embeddings_for_search(query: str) -> np.ndarray:
+    """Создает эмбеддинг для поискового запроса"""
+    model = get_model()
+    embedding = model.encode(query)
+    return embedding
